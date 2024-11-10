@@ -28,9 +28,12 @@
 #define CARD_SIZE 4
 #define EEPROM_SIZE 512
 
+
+
+
 // WiFi credentials
 const char* ssid = "SSID HERE";
-const char* password = "SSID PASSWORD HEREE";
+const char* password = "SSID PASSWORD HERE";
 
 // MQTT och API settings
 const char* mqttServer = "YOUR-IP";
@@ -39,10 +42,22 @@ const char* mqtt_topic = "rfid/readings";
 const char* API_URL = "http://YOUR-IP:8000";
 
 // Timer intervals
+const unsigned long MAX_OFFLINE_TIME = 18000000; // 5 h
 unsigned long lastSync = 0;
 const unsigned long SYNC_INTERVAL = 300000; // 5 min
 unsigned long lastUpdateCheck = 0;
 const unsigned long UPDATE_CHECK_INTERVAL = 86400000; // 24 h
+
+const unsigned long MODE_TIMEOUT = 30000;        // 30 sekunder timeout for admin-mode
+unsigned long modeStartTime = 0;            // for timeout-managment
+
+/*
+
+possible future implentation for battery check if battery level is low
+
+const unsigned long BATTERY_CHECK_INTERVAL = 0; 
+unsigned long lastBatteryCheck = 0; 
+*/
 
 // OTA settings
 String currentVersion = "1.0.0";  // Current firmware version
@@ -145,23 +160,80 @@ String cardIdToString(byte* uid);
 void reconnectMQTT();
 void handleAccessResult(bool granted, const char* operation = "access");
 
+
+
 // MQTT callback
 void callback(char* topic, byte* payload, unsigned int length) {
     String message = String((char*)payload, length);
     
-    // Handle responses
+    // Handle responses from server
     if (strstr(topic, "/response")) {
         lastResponse = message;
+        DynamicJsonDocument response(256);
+        deserializeJson(response, message);
+        
+        if (response.containsKey("authorized")) {
+            handleAccessResult(response["authorized"]);
+            if (Serial) {
+                Serial.print("Access ");
+                Serial.println(response["authorized"] ? "Granted" : "Denied");
+            }
+        }
         return;
     }
     
-    // Process message
+    // Process incoming message
     DynamicJsonDocument doc(256);
     deserializeJson(doc, message);
     
     if (doc.containsKey("command")) {
         String command = doc["command"].as<String>();
-        // Process command...
+        
+        if (command == "add_mode") {
+            currentMode = ADMIN_MODE;
+            pendingCommand = "add";
+            modeStartTime = millis();
+            digitalWrite(GREEN_LED_PIN, HIGH);
+            tone(BUZZER_PIN, TONE_ADD, 500);
+            if (Serial) Serial.println("Add mode activated via MQTT");
+        }
+        else if (command == "remove_mode") {
+            currentMode = ADMIN_MODE;
+            pendingCommand = "remove";
+            modeStartTime = millis();
+            digitalWrite(RED_LED_PIN, HIGH);
+            tone(BUZZER_PIN, TONE_REMOVE, 500);
+            if (Serial) Serial.println("Remove mode activated via MQTT");
+        }
+        else if (command == "cancel") {
+            currentMode = DOOR_MODE;
+            pendingCommand = "";
+            digitalWrite(GREEN_LED_PIN, LOW);
+            digitalWrite(RED_LED_PIN, LOW);
+            if (Serial) Serial.println("Admin mode cancelled via MQTT");
+        }
+        else if (command == "sync_request") {
+            //if (Serial) Serial.println("Sync request received");
+            syncWithServer();
+        }
+        else if (command == "update") {
+            if (Serial) Serial.println("Checking for updates...");
+            checkForUpdates();
+        }
+        else if (command == "status") {
+            // Report device status back via MQTT
+            DynamicJsonDocument statusDoc(256);
+            statusDoc["device_id"] = deviceId;
+            statusDoc["mode"] = currentMode == ADMIN_MODE ? "ADMIN" : "DOOR";
+            statusDoc["version"] = currentVersion;
+            statusDoc["uptime"] = millis();
+            
+            String statusMessage;
+            serializeJson(statusDoc, statusMessage);
+            client.publish(String(mqtt_topic + String("/status")).c_str(), statusMessage.c_str());
+            
+            if (Serial) Serial.println("Status report sent");
+        }
     }
 }
 
@@ -339,6 +411,7 @@ void reconnectMQTT() {
         
         if (client.connect(clientId.c_str())) {
             Serial.println("connected");
+            client.subscribe(mqtt_topic);
             client.subscribe(String(mqtt_topic + String("/response")).c_str());
         } else {
             Serial.print("failed, rc=");
@@ -378,11 +451,13 @@ void handleCommands() {
             Serial.println("Place card to add...");
             currentMode = ADMIN_MODE;
             pendingCommand = "add";
+            modeStartTime = millis();
         }
         else if (command == "remove") {
             Serial.println("Place card to remove...");
             currentMode = ADMIN_MODE;
             pendingCommand = "remove";
+            modeStartTime = millis();
         }
         else if (command == "list") {
             listCards();
@@ -487,8 +562,18 @@ void setup() {
     pinMode(GREEN_LED_PIN, OUTPUT);
     pinMode(RED_LED_PIN, OUTPUT);
     pinMode(BUZZER_PIN, OUTPUT);
+
+    // Test LED och Buzzer
+    digitalWrite(GREEN_LED_PIN, HIGH);
+    digitalWrite(RED_LED_PIN, HIGH);
+    tone(BUZZER_PIN, TONE_SUCCESS, 200);
+    delay(500);
+    digitalWrite(GREEN_LED_PIN, LOW);
+    digitalWrite(RED_LED_PIN, LOW);
+    
     // Generate unique device ID
     deviceId = "ESP32_" + String((uint32_t)ESP.getEfuseMac(), HEX);
+    Serial.println("Device ID: " + deviceId);
     
     // Initialize EEPROM
     EEPROM.begin(EEPROM_SIZE);
@@ -503,12 +588,22 @@ void setup() {
     Serial.print("RFID Version: 0x");
     Serial.println(v, HEX);
     
-    // Connect to WiFi
+    // Connect to WiFi with visual feedback
     WiFi.begin(ssid, password);
+    Serial.print("Connecting to WiFi");
     while (WiFi.status() != WL_CONNECTED) {
-        delay(500);
+        digitalWrite(RED_LED_PIN, HIGH);
+        delay(250);
+        digitalWrite(RED_LED_PIN, LOW);
+        delay(250);
         Serial.print(".");
     }
+    // WiFi connected indication
+    digitalWrite(GREEN_LED_PIN, HIGH);
+    tone(BUZZER_PIN, TONE_SUCCESS, 200);
+    delay(500);
+    digitalWrite(GREEN_LED_PIN, LOW);
+    
     Serial.println("\nWiFi connected");
     Serial.print("IP Address: ");
     Serial.println(WiFi.localIP());
@@ -522,13 +617,51 @@ void setup() {
     client.setServer(mqttServer, mqttPort);
     client.setCallback(callback);
     
+    // Connect to MQTT
+    String clientId = "ESP32Client-" + String(random(0xffff), HEX);
+    Serial.print("Connecting to MQTT as: ");
+    Serial.println(clientId);
+    
+    if (client.connect(clientId.c_str())) {
+        Serial.println("Connected to MQTT");
+        // Subscribe to topics
+        if (client.subscribe(mqtt_topic)) {
+            Serial.println("Subscribed to main topic");
+        }
+        if (client.subscribe(String(mqtt_topic + String("/response")).c_str())) {
+            Serial.println("Subscribed to response topic");
+        }
+        // MQTT connected indication
+        digitalWrite(GREEN_LED_PIN, HIGH);
+        tone(BUZZER_PIN, TONE_SUCCESS, 200);
+        delay(500);
+        digitalWrite(GREEN_LED_PIN, LOW);
+    } else {
+        Serial.print("MQTT connection failed, rc=");
+        Serial.println(client.state());
+        // Error indication
+        for(int i = 0; i < 3; i++) {
+            digitalWrite(RED_LED_PIN, HIGH);
+            tone(BUZZER_PIN, TONE_ERROR, 200);
+            delay(200);
+            digitalWrite(RED_LED_PIN, LOW);
+            delay(200);
+        }
+    }
+    
     // Initial sync with server
     syncWithServer();
     
     Serial.println("Setup complete!");
+    // Setup complete indication
+    digitalWrite(GREEN_LED_PIN, HIGH);
+    tone(BUZZER_PIN, TONE_SUCCESS, 500);
+    delay(1000);
+    digitalWrite(GREEN_LED_PIN, LOW);
 }
 
 void loop() {
+    // Check MQTT connection
     if (!client.connected()) {
         reconnectMQTT();
     }
@@ -540,6 +673,7 @@ void loop() {
     if (currentMillis - lastSync >= SYNC_INTERVAL) {
         syncWithServer();
         lastSync = currentMillis;
+        lastServerSync = currentMillis;  // Uppdate offline timer when we sync
     }
     
     if (currentMillis - lastUpdateCheck >= UPDATE_CHECK_INTERVAL) {
@@ -547,8 +681,10 @@ void loop() {
         lastUpdateCheck = currentMillis;
     }
     
-    // Handle serial commands
-    handleCommands();
+    // Handle serial commands if available
+    if (Serial) {
+        handleCommands();
+    }
     
     // Check for new cards
     if (rfid.PICC_IsNewCardPresent() && rfid.PICC_ReadCardSerial()) {
@@ -557,58 +693,105 @@ void loop() {
                 handleCardOperation("add_card", rfid.uid.uidByte);
                 pendingCommand = "";
                 currentMode = DOOR_MODE;
+                digitalWrite(GREEN_LED_PIN, LOW);
             } 
             else if (pendingCommand == "remove") {
                 handleCardOperation("remove_card", rfid.uid.uidByte);
                 pendingCommand = "";
                 currentMode = DOOR_MODE;
+                digitalWrite(RED_LED_PIN, LOW);
             }
         } 
         else {
             // Normal card reading in door mode
-            String cardId = cardIdToString(rfid.uid.uidByte);
+            bool locallyVerified = false;
             
-            DynamicJsonDocument doc(256);
-            doc["uid"] = cardId;
-            doc["timestamp"] = millis();
-            doc["device_id"] = deviceId;
-            
-            String message;
-            serializeJson(doc, message);
-            
-            if (client.publish(mqtt_topic, message.c_str())) {
-                // Wait for response (timeout after 2 seconds)
-                unsigned long startTime = millis();
-                bool responseReceived = false;
-                
-                while (millis() - startTime < 2000 && !responseReceived) {
-                    client.loop();
-                    if (lastResponse.length() > 0) {
-                        DynamicJsonDocument response(256);
-                        deserializeJson(response, lastResponse);
-                        
-                        // Check authorization
-                        if (response.containsKey("authorized")) {
-                            handleAccessResult(response["authorized"]);
-                            responseReceived = true;
-                        }
-                        lastResponse = "";
+            // Check locally stored cards first
+            for (int i = 0; i < numCards; i++) {
+                bool match = true;
+                for (byte j = 0; j < CARD_SIZE; j++) {
+                    if (rfid.uid.uidByte[j] != storedCards[i][j]) {
+                        match = false;
+                        break;
                     }
-                    delay(10);
                 }
+                if (match) {
+                    locallyVerified = true;
+                    break;
+                }
+            }
+
+            // If MQTT is connected, proceed with server verification
+            if (client.connected()) {
+                String cardId = cardIdToString(rfid.uid.uidByte);
+                DynamicJsonDocument doc(256);
+                doc["uid"] = cardId;
+                doc["timestamp"] = millis();
+                doc["device_id"] = deviceId;
                 
-                if (!responseReceived) {
-                    Serial.println("No response from server - Access Denied");
-                    handleAccessResult(false);
+                String message;
+                serializeJson(doc, message);
+                
+                if (client.publish(mqtt_topic, message.c_str())) {
+                    unsigned long startTime = millis();
+                    bool responseReceived = false;
+                    
+                    while (millis() - startTime < 2000 && !responseReceived) {
+                        client.loop();
+                        if (lastResponse.length() > 0) {
+                            DynamicJsonDocument response(256);
+                            deserializeJson(response, lastResponse);
+                            
+                            if (response.containsKey("authorized")) {
+                                handleAccessResult(response["authorized"]);
+                                if (Serial) {
+                                    Serial.print("Access ");
+                                    Serial.println(response["authorized"] ? "Granted" : "Denied");
+                                }
+                                responseReceived = true;
+                            }
+                            lastResponse = "";
+                        }
+                        delay(10);
+                    }
+                    
+                    if (!responseReceived) {
+                        if (Serial) Serial.println("No response from server - Using local verification");
+                        if (currentMillis - lastServerSync < MAX_OFFLINE_TIME) {
+                            handleAccessResult(locallyVerified);
+                        } else {
+                            handleAccessResult(false);
+                        }
+                    }
+                } else {
+                    if (Serial) Serial.println("Failed to send card reading - Using local verification");
+                    if (currentMillis - lastServerSync < MAX_OFFLINE_TIME) {
+                        handleAccessResult(locallyVerified);
+                    } else {
+                        handleAccessResult(false);
+                    }
                 }
             } else {
-                Serial.println("Failed to send card reading");
-                handleAccessResult(false);
+                // Offline mode with time limit
+                if (currentMillis - lastServerSync < MAX_OFFLINE_TIME) {
+                    handleAccessResult(locallyVerified);
+                } else {
+                    handleAccessResult(false);
+                }
             }
         }
         
         rfid.PICC_HaltA();
         rfid.PCD_StopCrypto1();
+    }
+
+    // Handle mode timeout
+    if (currentMode == ADMIN_MODE && (currentMillis - modeStartTime > MODE_TIMEOUT)) {
+        currentMode = DOOR_MODE;
+        pendingCommand = "";
+        digitalWrite(GREEN_LED_PIN, LOW);
+        digitalWrite(RED_LED_PIN, LOW);
+        if (Serial) Serial.println("Admin mode timeout");
     }
     
     delay(100);
