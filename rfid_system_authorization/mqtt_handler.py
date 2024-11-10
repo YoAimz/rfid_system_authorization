@@ -87,14 +87,17 @@ class MQTTHandler:
         except Exception as e:
             logger.error(f"Error in subscribe: {e}")
 
-    def on_disconnect(self, client, userdata, rc):
+    def on_disconnect(self, client, userdata, rc, properties=None, reason_code=None, reasonstr=None):
         """
-        Callback for when the client disconnects
+        Callback when client disconnects
         
         Args:
             client: MQTT client instance
             userdata: Private user data
             rc: Disconnect result code
+            properties: MQTT v5.0 properties (optional)
+            reason_code: Disconnect reason code (optional)
+            reasonstr: Reason string (optional)
         """
         if rc != 0:
             logger.warning(f"Unexpected disconnection. RC: {rc}")
