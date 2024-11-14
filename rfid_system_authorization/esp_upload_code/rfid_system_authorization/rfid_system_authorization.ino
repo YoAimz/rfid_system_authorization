@@ -50,6 +50,7 @@ const unsigned long UPDATE_CHECK_INTERVAL = 86400000; // 24 h
 
 const unsigned long MODE_TIMEOUT = 30000;        // 30 sekunder timeout for admin-mode
 unsigned long modeStartTime = 0;            // for timeout-managment
+unsigned long lastServerSync = 0;
 
 /*
 
